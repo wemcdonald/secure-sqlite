@@ -6,8 +6,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/wemcdonald/secure_sqlite/internal/auth"
-	"github.com/wemcdonald/secure_sqlite/pkg/secure_sqlite"
+	"github.com/wemcdonald/secure_sqlite"
+	"github.com/wemcdonald/secure_sqlite/pkg/auth"
+	"github.com/wemcdonald/secure_sqlite/pkg/permissions"
 )
 
 func main() {
@@ -18,81 +19,154 @@ func main() {
 	}
 	defer os.Remove(tmpFile.Name())
 
-	// Create a mock auth provider
-	mockAuth := &auth.MockProvider{}
+	// Create a memory auth provider
+	memoryAuth := auth.NewMemoryProvider()
 
 	// Create the secure database
-	config := secure_sqlite.Config{
-		DBPath:       tmpFile.Name(),
-		AuthProvider: mockAuth,
-	}
-
-	db, err := secure_sqlite.NewSecureDB(config)
+	db, err := secure_sqlite.Open(tmpFile.Name(), memoryAuth, "admin", "admin-token")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	// Create a user
-	username := "alice"
-	token := "secret-token"
-	err = db.CreateUser(username, token)
+	// Create users
+	adminUser := "admin"
+	adminToken := "admin-token"
+	user1 := "alice"
+	user1Token := "alice-token"
+	user2 := "bob"
+	user2Token := "bob-token"
+
+	memoryAuth.AddUser(adminUser, adminToken)
+	memoryAuth.AddUser(user1, user1Token)
+	memoryAuth.AddUser(user2, user2Token)
+
+	// Create roles
+	adminRoleID, err := db.CreateRole("admin")
+	if err != nil {
+		log.Fatal(err)
+	}
+	userRoleID, err := db.CreateRole("user")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Create a session
-	session, err := db.CreateSession(username, token)
+	// Assign roles to users
+	err = db.AssignRoleToUser(adminUser, "admin")
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("Created session: %s\n", session.ID)
+	err = db.AssignRoleToUser(user1, "user")
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = db.AssignRoleToUser(user2, "user")
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	// Create a test table
-	_, err = db.Exec(username, token, `
+	// Create test tables
+	_, err = db.Exec(adminUser, adminToken, `
 		CREATE TABLE users (
 			id INTEGER PRIMARY KEY,
 			name TEXT NOT NULL,
 			email TEXT UNIQUE NOT NULL,
-			created_at TIMESTAMP NOT NULL
+			created_at TIMESTAMP NOT NULL,
+			department TEXT NOT NULL
 		)
 	`)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Insert some data
-	_, err = db.Exec(username, token, `
-		INSERT INTO users (name, email, created_at)
-		VALUES (?, ?, ?)
-	`, "Alice Smith", "alice@example.com", time.Now())
+	// Grant permissions to roles
+	// Admin has full access
+	err = db.GrantTablePermission(adminRoleID, "users", permissions.TablePermission)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Query the data
-	rows, err := db.Query(username, token, "SELECT * FROM users")
+	// Users can only select their own department's data
+	err = db.GrantTablePermission(userRoleID, "users", permissions.TablePermission)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = db.GrantColumnPermission(userRoleID, "users", "email", permissions.ColumnPermission)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = db.GrantRowPermission(userRoleID, "users", "department = current_user_department()", permissions.RowPermission)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Insert test data
+	_, err = db.Exec(adminUser, adminToken, `
+		INSERT INTO users (name, email, created_at, department)
+		VALUES 
+			('Alice Smith', 'alice@example.com', ?, 'Engineering'),
+			('Bob Johnson', 'bob@example.com', ?, 'Marketing'),
+			('Charlie Brown', 'charlie@example.com', ?, 'Engineering')
+	`, time.Now(), time.Now(), time.Now())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Test admin access (should see all users)
+	fmt.Println("\nAdmin view (all users):")
+	rows, err := db.Query(adminUser, adminToken, "SELECT * FROM users")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer rows.Close()
 
-	// Print results
 	for rows.Next() {
 		var id int64
-		var name, email string
+		var name, email, department string
 		var createdAt time.Time
-		err := rows.Scan(&id, &name, &email, &createdAt)
+		err := rows.Scan(&id, &name, &email, &createdAt, &department)
 		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Printf("User: %s (%s)\n", name, email)
+		fmt.Printf("User: %s (%s) - Department: %s\n", name, email, department)
 	}
 
-	// Terminate the session
-	err = db.TerminateSession(session.ID)
+	// Test user access (should only see users in their department)
+	fmt.Println("\nUser view (department-filtered):")
+	rows, err = db.Query(user1, user1Token, "SELECT * FROM users")
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("Session terminated")
+	defer rows.Close()
+
+	for rows.Next() {
+		var id int64
+		var name, email, department string
+		var createdAt time.Time
+		err := rows.Scan(&id, &name, &email, &createdAt, &department)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("User: %s (%s) - Department: %s\n", name, email, department)
+	}
+
+	// Test column-level permissions
+	fmt.Println("\nTesting column-level permissions:")
+	rows, err = db.Query(user1, user1Token, "SELECT id, email FROM users")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id int64
+		var email string
+		err := rows.Scan(&id, &email)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("User ID: %d, Email: %s\n", id, email)
+	}
+
+	fmt.Println("\nExample completed successfully")
 }
